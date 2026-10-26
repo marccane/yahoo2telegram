@@ -228,3 +228,7 @@ Also delete the app password in your Yahoo account security settings.
 | `.gitignore` | Keeps `.env` (and run-time files) out of git |
 | `yahoo2telegram.service` | systemd unit that runs the script once |
 | `yahoo2telegram.timer` | Runs the service every minute |
+
+## License
+
+MIT, see [LICENSE](LICENSE).
