@@ -1,0 +1,11 @@
+[Unit]
+Description=Forward new Yahoo Mail messages to Telegram
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+DynamicUser=yes
+StateDirectory=yahoo2telegram
+EnvironmentFile=/etc/yahoo2telegram.env
+ExecStart=/usr/bin/python3 /opt/yahoo2telegram/yahoo2telegram.py
