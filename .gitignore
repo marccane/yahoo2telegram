@@ -1,0 +1,7 @@
+# Real settings (passwords, bot token): never commit them
+yahoo2telegram.env
+
+# Written next to the script when it is run by hand
+state.json
+state.tmp
+__pycache__/

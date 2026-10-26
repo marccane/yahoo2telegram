@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Forward new Yahoo Mail messages to a Telegram forum topic.
+"""Forward new Yahoo Mail messages to a Telegram group or one of its topics.
 
-Each run connects to Yahoo over IMAP, fetches every INBOX message newer than
-the last one it forwarded, and posts it (headers, body text, attachments) to
-a topic in a Telegram group via a bot. Meant to be run every minute by a
-systemd timer. Only the Python standard library is used.
+Each run connects to Yahoo over IMAP, fetches every Inbox and Spam message
+newer than the last one it forwarded, and posts it (headers, body text,
+attachments) to a Telegram group via a bot, optionally into a forum topic.
+Meant to be run every minute by a systemd timer. Only the Python standard
+library is used.
 
-Configuration comes from environment variables (see yahoo2telegram.env).
-Run with --test to send a test message to the topic and exit.
+Configuration comes from environment variables (see yahoo2telegram.env.default).
+Run with --test to send a test message and exit.
 """
 import email
 import email.policy
@@ -39,12 +40,19 @@ YAHOO_USER = env("YAHOO_USER")
 YAHOO_APP_PASSWORD = env("YAHOO_APP_PASSWORD")
 TG_BOT_TOKEN = env("TG_BOT_TOKEN")
 TG_CHAT_ID = env("TG_CHAT_ID")
-TG_THREAD_ID = int(env("TG_THREAD_ID"))
+TG_THREAD_ID = os.environ.get("TG_THREAD_ID", "").strip()  # optional forum topic
+if TG_THREAD_ID and not TG_THREAD_ID.isdigit():
+    sys.exit("TG_THREAD_ID must be a number")
 MAILBOX = env("MAILBOX", "INBOX")
+SPAM_FOLDER = env("SPAM_FOLDER", "auto")  # "auto", a folder name, or "none"
 MAX_BODY_CHARS = int(env("MAX_BODY_CHARS", "12000"))
 FORWARD_ATTACHMENTS = env("FORWARD_ATTACHMENTS", "1") == "1"
 BACKFILL = env("BACKFILL", "0") == "1"
 STATE_FILE = Path(env("STATE_DIRECTORY", str(Path(__file__).resolve().parent))) / "state.json"
+
+TG_TARGET = {"chat_id": TG_CHAT_ID}
+if TG_THREAD_ID:
+    TG_TARGET["message_thread_id"] = int(TG_THREAD_ID)
 
 
 # ---------------------------------------------------------------- telegram
@@ -90,8 +98,7 @@ def tg(method, fields, files=None):
 def send_text(text):
     for chunk in split_text(text, TG_TEXT_LIMIT):
         tg("sendMessage", {
-            "chat_id": TG_CHAT_ID,
-            "message_thread_id": TG_THREAD_ID,
+            **TG_TARGET,
             "text": chunk,
             "link_preview_options": {"is_disabled": True},
         })
@@ -99,8 +106,7 @@ def send_text(text):
 
 def send_file(filename, data, caption=""):
     tg("sendDocument", {
-        "chat_id": TG_CHAT_ID,
-        "message_thread_id": TG_THREAD_ID,
+        **TG_TARGET,
         "caption": caption[:1024],
     }, {"document": (filename, data)})
 
@@ -171,11 +177,10 @@ def body_text(msg):
     return clean(content)
 
 
-def forward(raw):
-    msg = email.message_from_bytes(raw, policy=email.policy.default)
-
-    header = [f"📧 {msg.get('Subject', '(no subject)')}",
-              f"From: {msg.get('From', '?')}"]
+def forward(msg, label=""):
+    header = [label] if label else []
+    header += [f"📧 {msg.get('Subject', '(no subject)')}",
+               f"From: {msg.get('From', '?')}"]
     if msg.get("To"):
         header.append(f"To: {msg['To']}")
     if msg.get("Cc"):
@@ -212,9 +217,12 @@ def forward(raw):
 
 def load_state():
     try:
-        return json.loads(STATE_FILE.read_text())
+        state = json.loads(STATE_FILE.read_text())
     except FileNotFoundError:
-        return None
+        return {"mailboxes": {}, "recent_ids": []}
+    if "uidvalidity" in state:  # format used before the spam folder was watched
+        state = {"mailboxes": {MAILBOX: state}, "recent_ids": []}
+    return state
 
 
 def save_state(state):
@@ -223,47 +231,90 @@ def save_state(state):
     tmp.replace(STATE_FILE)
 
 
-def mailbox_status(imap):
-    typ, data = imap.status(MAILBOX, "(UIDVALIDITY UIDNEXT)")
+def quote(mailbox):
+    return '"' + mailbox.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def find_spam_folder(imap):
+    if SPAM_FOLDER.lower() == "none":
+        return None
+    if SPAM_FOLDER.lower() != "auto":
+        return SPAM_FOLDER
+    typ, data = imap.list()
+    names = {}
+    for line in data if typ == "OK" else []:
+        m = re.match(rb'\((?P<flags>[^)]*)\) (?:"[^"]*"|NIL) "?(?P<name>.*?)"?$', line or b"")
+        if m:
+            names[m["name"].decode()] = m["flags"].decode().lower()
+    # Yahoo flags its spam folder ("Bulk") as \Junk.
+    return next((n for n, flags in names.items() if "\\junk" in flags),
+                "Bulk" if "Bulk" in names else None)
+
+
+def mailbox_status(imap, mailbox):
+    typ, data = imap.status(quote(mailbox), "(UIDVALIDITY UIDNEXT)")
     if typ != "OK":
-        raise RuntimeError(f"STATUS failed: {data}")
+        raise RuntimeError(f"STATUS {mailbox} failed: {data}")
     line = data[0].decode()
     validity = int(re.search(r"UIDVALIDITY (\d+)", line).group(1))
     uidnext = int(re.search(r"UIDNEXT (\d+)", line).group(1))
     return validity, uidnext
 
 
+def message_id(msg):
+    try:
+        return str(msg.get("Message-ID") or "").strip()
+    except Exception:  # malformed header
+        return ""
+
+
+def sync(imap, state, mailbox, label):
+    validity, uidnext = mailbox_status(imap, mailbox)
+    box = state["mailboxes"].get(mailbox)
+    if box is None or box["uidvalidity"] != validity:
+        if box is not None:
+            print(f"{mailbox}: UIDVALIDITY changed, restarting from the newest message")
+        # First time this mailbox is seen: start from "now" so everything
+        # already in it isn't dumped into the group, unless BACKFILL=1.
+        start = 0 if (box is None and BACKFILL) else uidnext - 1
+        box = state["mailboxes"][mailbox] = {"uidvalidity": validity, "last_uid": start}
+        save_state(state)
+
+    imap.select(quote(mailbox), readonly=True)  # read-only: never marks mail as read
+    typ, data = imap.uid("SEARCH", None, f"UID {box['last_uid'] + 1}:*")
+    if typ != "OK":
+        raise RuntimeError(f"SEARCH {mailbox} failed: {data}")
+    # "N:*" always matches the highest UID, even when it is below N.
+    uids = sorted(u for u in map(int, data[0].split()) if u > box["last_uid"])
+
+    for uid in uids:
+        typ, data = imap.uid("FETCH", str(uid), "(BODY.PEEK[])")
+        raw = next((item[1] for item in data if isinstance(item, tuple)), None)
+        if typ == "OK" and raw:
+            msg = email.message_from_bytes(raw, policy=email.policy.default)
+            msgid = message_id(msg)
+            # A mail moved out of spam with "Not spam" reappears in the inbox
+            # under a new UID; don't post it a second time.
+            if msgid and msgid in state["recent_ids"]:
+                print(f"{mailbox} UID {uid}: already forwarded, skipped")
+            else:
+                forward(msg, label)
+                print(f"{mailbox} UID {uid}: forwarded")
+                if msgid:
+                    state["recent_ids"] = (state["recent_ids"] + [msgid])[-1000:]
+        box["last_uid"] = uid
+        save_state(state)  # after each message, so a crash never re-sends
+
+
 def run():
     imap = imaplib.IMAP4_SSL(IMAP_HOST, 993, timeout=60)
     try:
         imap.login(YAHOO_USER, YAHOO_APP_PASSWORD)
-        validity, uidnext = mailbox_status(imap)
-
         state = load_state()
-        if state is None or state["uidvalidity"] != validity:
-            if state is not None:
-                print("UIDVALIDITY changed, restarting from the newest message")
-            # First run: start from "now" so the whole inbox isn't dumped into
-            # the group, unless BACKFILL=1 asks for that.
-            start = 0 if (state is None and BACKFILL) else uidnext - 1
-            state = {"uidvalidity": validity, "last_uid": start}
-            save_state(state)
-
-        imap.select(MAILBOX, readonly=True)  # read-only: never marks mail as read
-        typ, data = imap.uid("SEARCH", None, f"UID {state['last_uid'] + 1}:*")
-        if typ != "OK":
-            raise RuntimeError(f"SEARCH failed: {data}")
-        # "N:*" always matches the highest UID, even when it is below N.
-        uids = sorted(u for u in map(int, data[0].split()) if u > state["last_uid"])
-
-        for uid in uids:
-            typ, data = imap.uid("FETCH", str(uid), "(BODY.PEEK[])")
-            raw = next((item[1] for item in data if isinstance(item, tuple)), None)
-            if typ == "OK" and raw:
-                forward(raw)
-                print(f"forwarded UID {uid}")
-            state["last_uid"] = uid
-            save_state(state)  # after each message, so a crash never re-sends
+        sync(imap, state, MAILBOX, "")
+        spam = find_spam_folder(imap)
+        if spam:
+            sync(imap, state, spam, "🚫 Yahoo put this in the Spam folder")
     finally:
         try:
             imap.logout()
@@ -273,7 +324,7 @@ def run():
 
 if __name__ == "__main__":
     if "--test" in sys.argv:
-        send_text("✅ yahoo2telegram test message: the bot can post in this topic.")
+        send_text("✅ yahoo2telegram test message: the bot can post here.")
         print("test message sent")
     else:
         run()
